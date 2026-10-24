@@ -1,0 +1,20 @@
+<resources>
+    <string name="module_name">媒体卡片</string>
+    <string name="module_description">ColorOS通知页面添加媒体播放流体云</string>
+    <string name="settings_title">设置</string>
+    <string name="settings_master">启用媒体卡片</string>
+    <string name="settings_master_summary">开启或关闭媒体卡片功能</string>
+    <string name="settings_swipe">防止滑动移除</string>
+    <string name="settings_swipe_summary">阻止左右滑动移除媒体卡片</string>
+    <string name="settings_native_media_controls">原生媒体通知</string>
+    <string name="settings_native_media_controls_summary">开启或关闭安卓原生媒体通知</string>
+    <string name="settings_native_media_controls_no_root">无ROOT权限执行命令</string>
+    <string name="settings_native_media_controls_unavailable">无法读取系统设置</string>
+    <string name="settings_native_media_controls_command_failed">修改系统设置失败</string>
+    <string name="settings_native_media_controls_applied">settings put global qs_media_controls %1$d  请重启系统界面</string>
+    <string name="settings_logs">日志</string>
+    <string name="settings_logs_summary">开启或关闭模块运行日志</string>
+    <string name="logs_performance_warning">⚠可能影响性能⚠</string>
+    <string name="settings_hide_launcher">隐藏桌面图标</string>
+    <string name="settings_hide_launcher_summary">请先在 LSPosed 内关闭\"强制显示桌面图标\"</string>
+</resources>

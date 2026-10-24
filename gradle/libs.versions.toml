@@ -1,0 +1,20 @@
+[versions]
+agp = "9.5.0-alpha10"
+kotlin = "2.4.21"
+libxposed = "102.0.0"
+miuix = "0.9.4"
+activityCompose = "1.14.0-alpha03"
+composeBom = "2026.10.00"
+
+[libraries]
+libxposed-api = { group = "io.github.libxposed", name = "api", version.ref = "libxposed" }
+libxposed-service = { group = "io.github.libxposed", name = "service", version.ref = "libxposed" }
+mediacard-activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
+mediacard-compose-bom = { group = "androidx.compose", name = "compose-bom-alpha", version.ref = "composeBom" }
+androidx-compose-foundation = { group = "androidx.compose.foundation", name = "foundation" }
+androidx-compose-ui = { group = "androidx.compose.ui", name = "ui" }
+miuix-ui = { module = "top.yukonga.miuix.kmp:miuix-ui-android", version.ref = "miuix" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
