@@ -40,7 +40,11 @@ internal object NotificationCenterMediaHooks {
                 val supported = chain.proceed() as? Boolean ?: false
                 val receiver = chain.thisObject ?: return@Hooker supported
                 val entrance = chain.args.getOrNull(0) as? Int ?: return@Hooker supported
-                if (isMusicService(serviceIdField.get(receiver) as? String) && entrance in mediaEntrances) true else supported
+                if (isMusicService(serviceIdField.get(receiver) as? String) && entrance in mediaEntrances) {
+                    true
+                } else {
+                    supported
+                }
             })
 
             installMusicCloseEntry(entry, serviceIdField)
@@ -92,18 +96,11 @@ internal object MusicLiveAlertHostHook {
             HookRuntime.hook("systemui:music-live-alert-host", send, XposedInterface.Hooker { chain ->
                 if (chain.args.getOrNull(0) != "sendLiveAlert") return@Hooker chain.proceed()
                 val sbn = chain.args.getOrNull(1) as? StatusBarNotification ?: return@Hooker chain.proceed()
-                if (sbn.packageName != MediaCardModule.SYSTEM_UI || sbn.id.toString() != MediaCardModule.MUSIC_SERVICE_ID) {
+                if (
+                    sbn.packageName != MediaCardModule.SYSTEM_UI ||
+                    sbn.id.toString() != MediaCardModule.MUSIC_SERVICE_ID
+                ) {
                     return@Hooker chain.proceed()
-                }
-
-                val sourceOptions = runCatching {
-                    sbn.notification.extras.getString(OPTIONS)?.let(::JSONObject)
-                }.getOrNull()
-                val seedlingEligible = MusicSeedlingPlayback.hasEligibleMediaSession()
-                val nativeHosts = sourceOptions?.optJSONArray("showHostMap")?.let { hosts ->
-                    (0 until hosts.length()).mapNotNull { index ->
-                        hosts.optInt(index, Int.MIN_VALUE).takeUnless { it == Int.MIN_VALUE }
-                    }
                 }
 
                 // The OEM already chose the Live Alert hosts. This cache only reflects media
@@ -111,6 +108,15 @@ internal object MusicLiveAlertHostHook {
                 // still targets Notification Center. Do not add or remove host 16 from that data.
                 val result = chain.proceed()
                 if (HookRuntime.isLogsEnabled()) {
+                    val sourceOptions = runCatching {
+                        sbn.notification.extras.getString(OPTIONS)?.let(::JSONObject)
+                    }.getOrNull()
+                    val seedlingEligible = MusicSeedlingPlayback.hasEligibleMediaSession()
+                    val nativeHosts = sourceOptions?.optJSONArray("showHostMap")?.let { hosts ->
+                        (0 until hosts.length()).mapNotNull { index ->
+                            hosts.optInt(index, Int.MIN_VALUE).takeUnless { it == Int.MIN_VALUE }
+                        }
+                    }
                     // Log routing metadata only; never include notification extras or user content.
                     val state = "route=direct-live-alert, seedlingEligible=$seedlingEligible, " +
                         "hostMapChanged=false, nativeHosts=${nativeHosts ?: "unavailable"}, " +
@@ -181,12 +187,16 @@ internal object MusicSeedlingPlayback {
     private val eligibleSessionKeys = ConcurrentHashMap.newKeySet<String>()
     private val playbackStates = ConcurrentHashMap<String, Int>()
     private val refreshHandler = Handler(Looper.getMainLooper())
+    private val settingsListener: (HookFeatureConfig.Settings) -> Unit = { settings ->
+        if (!settings.master) cancelPendingRefresh()
+    }
     private val refreshLock = Any()
     private var pendingRefresh: Runnable? = null
     private var pendingRefreshToken: Any? = null
     private var lastRefreshAt = 0L
 
     fun install(loader: ClassLoader) {
+        HookRuntime.addSettingsListener(settingsListener)
         runCatching {
             val type = Reflect.findClass(MEDIA_DATA, loader)
             val instance = type.getField("Companion").get(null)
@@ -212,13 +222,16 @@ internal object MusicSeedlingPlayback {
         if (state == null) {
             eligibleSessionKeys.remove(key)
             playbackStates.remove(key)
+            MusicMediaRowHook.onMediaSessionStateChanged(key, eligible = false)
             return false
         }
         playbackStates[key] = state
         if (!eligible) {
             eligibleSessionKeys.remove(key)
+            MusicMediaRowHook.onMediaSessionStateChanged(key, eligible = false)
             return false
         }
+        MusicMediaRowHook.onMediaSessionStateChanged(key, eligible = true)
         val hadEligibleMedia = eligibleSessionKeys.isNotEmpty()
         val newlyEligible = eligibleSessionKeys.add(key)
         return newlyEligible && !hadEligibleMedia
@@ -237,6 +250,7 @@ internal object MusicSeedlingPlayback {
     fun onMediaDataRemoved(key: String) {
         eligibleSessionKeys.remove(key)
         playbackStates.remove(key)
+        MusicMediaRowHook.onMediaSessionRemoved(key)
     }
 
     fun hasEligibleMediaSession(): Boolean = eligibleSessionKeys.isNotEmpty()
@@ -260,6 +274,10 @@ internal object MusicSeedlingPlayback {
                 currentStates[key] = state
                 if (isCardEligibleState(state)) currentEligibleKeys.add(key)
             }
+            (playbackStates.keys - currentStates.keys).forEach(MusicMediaRowHook::onMediaSessionRemoved)
+            currentStates.forEach { (key, state) ->
+                MusicMediaRowHook.onMediaSessionStateChanged(key, key in currentEligibleKeys)
+            }
             playbackStates.clear()
             playbackStates.putAll(currentStates)
             eligibleSessionKeys.clear()
@@ -276,7 +294,8 @@ internal object MusicSeedlingPlayback {
             eligibleSessionKeys.clear()
             if (HookRuntime.isLogsEnabled()) {
                 HookRuntime.info(
-                    "Shade media snapshot unavailable: combine=${combineLatest != null}, seedling=${mediaSeedling != null}; cacheCleared=true"
+                    "Shade media snapshot unavailable: combine=${combineLatest != null}, " +
+                        "seedling=${mediaSeedling != null}; cacheCleared=true"
                 )
             }
         }
@@ -286,24 +305,34 @@ internal object MusicSeedlingPlayback {
     /** Re-run the OEM media update so provider and Notification Center rebuild the live card. */
     fun scheduleActiveCardRefresh(reason: String, delayMillis: Long = 100L) {
         synchronized(refreshLock) {
+            if (!HookRuntime.settingsSnapshot().master) {
+                cancelPendingRefreshLocked()
+                return
+            }
             pendingRefresh?.let(refreshHandler::removeCallbacks)
             val token = Any()
             val refresh = Runnable {
-                synchronized(refreshLock) {
-                    if (pendingRefreshToken !== token) return@Runnable
-                    pendingRefresh = null
-                    pendingRefreshToken = null
-                    lastRefreshAt = android.os.SystemClock.uptimeMillis()
+                val isCurrent = synchronized(refreshLock) {
+                    if (pendingRefreshToken !== token) {
+                        false
+                    } else {
+                        pendingRefresh = null
+                        pendingRefreshToken = null
+                        lastRefreshAt = android.os.SystemClock.uptimeMillis()
+                        true
+                    }
                 }
-                if (!hasEligibleMediaSession()) return@Runnable
+                if (!isCurrent || !HookRuntime.settingsSnapshot().master || !hasEligibleMediaSession()) {
+                    return@Runnable
+                }
                 val seedling = mediaSeedling ?: run {
-                    HookRuntime.warn("Cannot refresh active music card: MediaSeedling instance unavailable")
+                    HookRuntime.runtimeWarn { "Cannot refresh active music card: MediaSeedling instance unavailable" }
                     return@Runnable
                 }
                 MusicMediaCreationHook.enableCardCreation(seedling)
                 runCatching { Reflect.call(seedling, "postMediaDataUpdate", 1, reason) }
-                    .onSuccess { HookRuntime.info("Requested native active music card refresh: reason=$reason") }
-                    .onFailure { HookRuntime.warn("Cannot request native active music card refresh", it) }
+                    .onSuccess { HookRuntime.runtimeInfo { "Requested native active music card refresh: reason=$reason" } }
+                    .onFailure { HookRuntime.runtimeWarn(it) { "Cannot request native active music card refresh" } }
             }
             val now = android.os.SystemClock.uptimeMillis()
             val cooldown = (500L - (now - lastRefreshAt)).coerceAtLeast(0L)
@@ -315,19 +344,34 @@ internal object MusicSeedlingPlayback {
 
     /** Immediate panel-open refresh; bypasses the background cooldown and session-cache gate. */
     fun refreshActiveCardImmediately(reason: String) {
+        if (!HookRuntime.settingsSnapshot().master) return
+        synchronized(refreshLock) {
+            cancelPendingRefreshLocked()
+            lastRefreshAt = android.os.SystemClock.uptimeMillis()
+        }
         val seedling = mediaSeedling ?: run {
-            HookRuntime.warn("Cannot refresh active music card: MediaSeedling instance unavailable")
+            HookRuntime.runtimeWarn { "Cannot refresh active music card: MediaSeedling instance unavailable" }
             return
         }
         MusicMediaCreationHook.enableCardCreation(seedling)
         runCatching { Reflect.call(seedling, "postMediaDataUpdate", 1, reason) }
             .onSuccess {
-                HookRuntime.info(
+                HookRuntime.runtimeInfo {
                     "Immediately requested native music refresh: reason=$reason, " +
                         "eligible=${eligibleSessionKeys.size}, allowCreate=${hasEligibleMediaSession()}"
-                )
+                }
             }
-            .onFailure { HookRuntime.warn("Cannot immediately request native active music card refresh", it) }
+            .onFailure { HookRuntime.runtimeWarn(it) { "Cannot immediately request native active music card refresh" } }
+    }
+
+    private fun cancelPendingRefresh() {
+        synchronized(refreshLock) { cancelPendingRefreshLocked() }
+    }
+
+    private fun cancelPendingRefreshLocked() {
+        pendingRefresh?.let(refreshHandler::removeCallbacks)
+        pendingRefresh = null
+        pendingRefreshToken = null
     }
 }
 
@@ -343,7 +387,7 @@ internal object MusicMediaCreationHook {
                 type.getDeclaredField("allowCreateCard").apply { isAccessible = true }
             }
             field.setBoolean(seedling, true)
-        }.onFailure { HookRuntime.warn("Cannot enable card creation for native media refresh", it) }
+        }.onFailure { HookRuntime.runtimeWarn(it) { "Cannot enable card creation for native media refresh" } }
     }
 
     fun install(loader: ClassLoader) {
@@ -367,31 +411,32 @@ internal object MusicMediaCreationHook {
                     allowCreateFields.computeIfAbsent(receiver.javaClass) { type ->
                         type.getDeclaredField("allowCreateCard").apply { isAccessible = true }
                     }
-                }.onFailure { HookRuntime.warn("Cannot access media card creation flag", it) }.getOrNull()
+                }.onFailure { HookRuntime.runtimeWarn(it) { "Cannot access media card creation flag" } }.getOrNull()
                 if (!currentMediaEligible && !MusicSeedlingPlayback.shouldRetainCard()) {
                     if (HookRuntime.isLogsEnabled()) {
                         HookRuntime.info(
-                            "Seedling media state: key=${key?.let(::diagnosticKey)}, state=$currentState, " +
-                                "eligible=false, remaining=${MusicSeedlingPlayback.eligibleMediaCount()}, action=allow-stop"
+                            "Seedling media state: key=${key?.let(::mediaKeyForLog)}, state=$currentState, " +
+                            "eligible=false, remaining=${MusicSeedlingPlayback.eligibleMediaCount()}, " +
+                                "action=allow-stop"
                         )
                     }
                     val result = chain.proceed()
                     runCatching {
                         allowCreate?.setBoolean(receiver, false)
-                    }.onFailure { HookRuntime.warn("Cannot disable stopped music card creation", it) }
+                    }.onFailure { HookRuntime.runtimeWarn(it) { "Cannot disable stopped music card creation" } }
                     return@Hooker result
                 }
                 fun allowCardCreation() = runCatching {
                     val field = allowCreate ?: return@runCatching
                     if (!field.getBoolean(receiver)) {
                         field.setBoolean(receiver, true)
-                        HookRuntime.info("Re-enabled media card creation for active music playback")
+                        HookRuntime.runtimeInfo { "Re-enabled media card creation for active music playback" }
                     }
-                }.onFailure { HookRuntime.warn("Cannot re-enable Meizu Music card creation", it) }
+                }.onFailure { HookRuntime.runtimeWarn(it) { "Cannot re-enable Meizu Music card creation" } }
                 allowCardCreation()
                 if (HookRuntime.isLogsEnabled()) {
                     HookRuntime.info(
-                        "Seedling media state: key=${key?.let(::diagnosticKey)}, state=$currentState, " +
+                        "Seedling media state: key=${key?.let(::mediaKeyForLog)}, state=$currentState, " +
                             "eligible=true, becameEligible=$becameEligible, " +
                             "active=${MusicSeedlingPlayback.eligibleMediaCount()}, action=allow-create"
                     )
@@ -452,7 +497,7 @@ internal object MusicMediaDataRemovalHook {
                         (Reflect.field(receiver, "entries") as? Map<*, *>)?.get(key)
                     }.getOrNull()
                     HookRuntime.info(
-                        "Forwarded native media-source removal: key=${diagnosticKey(key)}, " +
+                        "Forwarded native media-source removal: key=${mediaKeyForLog(key)}, " +
                             "entryFound=${keyedMedia != null}, remaining=${MusicSeedlingPlayback.eligibleMediaCount()}"
                     )
                 }
@@ -464,14 +509,38 @@ internal object MusicMediaDataRemovalHook {
 }
 
 internal object MusicMediaRowHook {
+    private const val MAX_RETIRED_MEDIA_KEYS = 64
     @Volatile private var customRowManager: Any? = null
     @Volatile private var cachedMusicEntry: Any? = null
+    private val retiredMediaKeys = LinkedHashSet<String>()
+    private val retiredMediaKeysLock = Any()
     private val lastRestoreState = AtomicReference<String>()
     private val revealLock = Any()
     private val mainHandler = Handler(Looper.getMainLooper())
     private var revealPending = false
     @Volatile private var notificationPanelForeground = false
     @Volatile private var panelRefreshRequested = false
+
+    /** Retire only rows whose OEM entry key exactly matches an inactive Seedling media key. */
+    fun onMediaSessionStateChanged(key: String, eligible: Boolean) {
+        synchronized(retiredMediaKeysLock) {
+            retiredMediaKeys.remove(key)
+            if (!eligible) {
+                retiredMediaKeys.add(key)
+                while (retiredMediaKeys.size > MAX_RETIRED_MEDIA_KEYS) {
+                    retiredMediaKeys.remove(retiredMediaKeys.first())
+                }
+            }
+        }
+        if (!eligible && musicEntryKey(cachedMusicEntry) == key) cachedMusicEntry = null
+    }
+
+    fun onMediaSessionRemoved(key: String) = onMediaSessionStateChanged(key, eligible = false)
+
+    private fun isRetiredMusicEntry(entry: Any?): Boolean {
+        val key = musicEntryKey(entry) ?: return false
+        return synchronized(retiredMediaKeysLock) { key in retiredMediaKeys }
+    }
 
     fun install(loader: ClassLoader) {
         runCatching {
@@ -489,6 +558,7 @@ internal object MusicMediaRowHook {
                 val receiver = chain.thisObject ?: return@Hooker chain.proceed()
                 customRowManager = receiver
                 if (!notificationPanelForeground) return@Hooker chain.proceed()
+                val wasMusicRowVisible = hasVisibleMusicRow(receiver)
                 val eligibleMusic = MusicSeedlingPlayback.hasEligibleMediaSession()
                 val keepMusicVisible = eligibleMusic && hasMusicEntry(receiver)
                 val visible = requested || keepMusicVisible
@@ -500,6 +570,9 @@ internal object MusicMediaRowHook {
                 // even after its ViewState.gone flag is cleared. Re-apply VISIBLE after that
                 // branch completes so the Notification Center host sees the music row.
                 if (keepMusicVisible) revealActiveMusicRow(receiver, rowCompanion, rowClassifier)
+                if (!wasMusicRowVisible && visible && hasVisibleMusicRow(receiver)) {
+                    MediaCoverAppearanceHook.repairVisibleBackgroundMargins("music-row-became-visible")
+                }
                 result
             })
             installExposeActiveMusicController(manager, rowCompanion, rowClassifier)
@@ -523,7 +596,8 @@ internal object MusicMediaRowHook {
             val callback = manager.getDeclaredMethod(
                 "setRequestImmersiveStateListener",
                 Reflect.findClass(
-                    "com.oplus.systemui.statusbar.notification.customcard.OplusCustomRowControllerManager\$RequestImmersiveStateListener",
+                    "com.oplus.systemui.statusbar.notification.customcard." +
+                        "OplusCustomRowControllerManager\$RequestImmersiveStateListener",
                     manager.classLoader,
                 ),
             )
@@ -537,7 +611,7 @@ internal object MusicMediaRowHook {
 
     fun requestLockScreenImmersiveState(key: String): Boolean {
         val manager = customRowManager ?: run {
-            HookRuntime.warn("Cannot request OEM lock-screen immersive expansion: row manager unavailable")
+            HookRuntime.runtimeWarn { "Cannot request OEM lock-screen immersive expansion: row manager unavailable" }
             return false
         }
         val matchingEntry = runCatching {
@@ -550,24 +624,28 @@ internal object MusicMediaRowHook {
             }
         }.getOrDefault(false)
         if (!matchingEntry) {
-            HookRuntime.warn(
+            HookRuntime.runtimeWarn {
                 "Cannot request OEM lock-screen immersive expansion: clicked music row key is not registered " +
-                    "(key=${diagnosticKey(key)})"
-            )
+                    "(key=${mediaKeyForLog(key)})"
+            }
             return false
         }
         return runCatching {
             Reflect.call(manager, "requestImmersiveState", 1, 0x12f, key)
-            HookRuntime.info("Dispatched OEM lock-screen immersive expansion for registered music row: key=${diagnosticKey(key)}")
+            MediaCoverAppearanceHook.repairVisibleBackgroundMargins("lock-screen-immersive-request")
+            HookRuntime.runtimeInfo {
+                "Dispatched OEM lock-screen immersive expansion for registered music row: " +
+                    "key=${mediaKeyForLog(key)}"
+            }
             true
-        }.onFailure { HookRuntime.warn("Cannot request OEM lock-screen immersive expansion", it) }
+        }.onFailure { HookRuntime.runtimeWarn(it) { "Cannot request OEM lock-screen immersive expansion" } }
             .getOrDefault(false)
     }
 
     /** Resolve the sole registered music row behind the lock-screen album-art card. */
     fun requestActiveLockScreenMusicRow(): Boolean {
         val manager = customRowManager ?: run {
-            HookRuntime.warn("Cannot resolve lock-screen album-art target: row manager unavailable")
+            HookRuntime.runtimeWarn { "Cannot resolve lock-screen album-art target: row manager unavailable" }
             return false
         }
         val keys = LinkedHashSet<String>()
@@ -579,7 +657,7 @@ internal object MusicMediaRowHook {
                 val key = Reflect.call(entry, "getKey") as? String
                 if (isMusicService(serviceId) && !key.isNullOrBlank()) keys.add(key)
             }
-        }.onFailure { HookRuntime.warn("Cannot inspect lock-screen music row controllers", it) }
+        }.onFailure { HookRuntime.runtimeWarn(it) { "Cannot inspect lock-screen music row controllers" } }
         runCatching {
             val entries = Reflect.field(manager, "customRowEntryList") as? List<*>
             entries.orEmpty().forEach { entry ->
@@ -587,16 +665,18 @@ internal object MusicMediaRowHook {
                 val key = Reflect.call(entry, "getKey") as? String
                 if (isMusicService(serviceId) && !key.isNullOrBlank()) keys.add(key)
             }
-        }.onFailure { HookRuntime.warn("Cannot inspect lock-screen music row entries", it) }
+        }.onFailure { HookRuntime.runtimeWarn(it) { "Cannot inspect lock-screen music row entries" } }
         cachedMusicEntry?.let { entry ->
             runCatching {
                 val serviceId = Reflect.call(entry, "getServiceId") as? String
                 val key = Reflect.call(entry, "getKey") as? String
                 if (isMusicService(serviceId) && !key.isNullOrBlank()) keys.add(key)
-            }.onFailure { HookRuntime.warn("Cannot inspect cached lock-screen music row", it) }
+            }.onFailure { HookRuntime.runtimeWarn(it) { "Cannot inspect cached lock-screen music row" } }
         }
         if (keys.size != 1) {
-            HookRuntime.warn("Cannot resolve lock-screen album-art target: registered music row count=${keys.size}")
+            HookRuntime.runtimeWarn {
+                "Cannot resolve lock-screen album-art target: registered music row count=${keys.size}"
+            }
             return false
         }
         return requestLockScreenImmersiveState(keys.single())
@@ -655,32 +735,39 @@ internal object MusicMediaRowHook {
                 "onShadeExpansionFullyChanged", Boolean::class.javaPrimitiveType, panelType, callbackType,
             )
             HookRuntime.deoptimize(expanded)
-            HookRuntime.hook("systemui:refresh-music-on-notification-shade-open", expanded, XposedInterface.Hooker { chain ->
-                val isExpanded = chain.args.getOrNull(0) as? Boolean == true
-                val requestedPanel = chain.args.getOrNull(1)
-                val isNotificationPanel = requestedPanel === notificationPanel
-                val shouldRefresh = isNotificationPanel && isExpanded && !panelRefreshRequested
-                if (isNotificationPanel) {
-                    notificationPanelForeground = isExpanded
-                    if (isExpanded) panelRefreshRequested = true
-                }
-                val result = chain.proceed()
-                if (shouldRefresh) {
-                    // Fallback for devices that deliver the fully-expanded callback without a
-                    // preceding positive panel-fraction callback.
-                    refreshForNotificationCenter("notification-shade-expanded")
-                } else if (!isExpanded && isNotificationPanel) {
-                    panelRefreshRequested = false
-                }
-                result
-            })
+            HookRuntime.hook(
+                "systemui:refresh-music-on-notification-shade-open",
+                expanded,
+                XposedInterface.Hooker { chain ->
+                    val isExpanded = chain.args.getOrNull(0) as? Boolean == true
+                    val requestedPanel = chain.args.getOrNull(1)
+                    val isNotificationPanel = requestedPanel === notificationPanel
+                    val shouldRefresh = isNotificationPanel && isExpanded && !panelRefreshRequested
+                    if (isNotificationPanel) {
+                        notificationPanelForeground = isExpanded
+                        if (isExpanded) panelRefreshRequested = true
+                    }
+                    val result = chain.proceed()
+                    if (shouldRefresh) {
+                        // Fallback for devices that deliver the fully-expanded callback without a
+                        // preceding positive panel-fraction callback.
+                        refreshForNotificationCenter("notification-shade-expanded")
+                    } else if (!isExpanded && isNotificationPanel) {
+                        panelRefreshRequested = false
+                    }
+                    result
+                },
+            )
         }.onFailure { HookRuntime.installWarn("Notification Center expansion refresh hook unavailable", it) }
     }
 
     /** Clear stale panel state when the shade window itself becomes hidden or detached. */
     private fun installShadeWindowVisibilityReset(loader: ClassLoader) {
         runCatching {
-            val shadeWindow = Reflect.findClass("com.oplus.systemui.shade.OplusNotificationShadeWindowViewExImpl", loader)
+            val shadeWindow = Reflect.findClass(
+                "com.oplus.systemui.shade.OplusNotificationShadeWindowViewExImpl",
+                loader,
+            )
             val shadeView = Reflect.findClass("com.android.systemui.shade.NotificationShadeWindowView", loader)
             val visibilityChanged = shadeWindow.getDeclaredMethod(
                 "onWindowVisibilityChanged", Int::class.javaPrimitiveType, shadeView,
@@ -692,6 +779,8 @@ internal object MusicMediaRowHook {
                     if (visibility != null && visibility != View.VISIBLE) {
                         notificationPanelForeground = false
                         panelRefreshRequested = false
+                    } else if (visibility == View.VISIBLE) {
+                        MediaCoverAppearanceHook.repairVisibleBackgroundMargins("shade-window-visible")
                     }
                     result
                 })
@@ -720,7 +809,7 @@ internal object MusicMediaRowHook {
                 }.getOrDefault(false) } ?: return@Hooker original
                 if (original.any { it === musicController }) return@Hooker original
                 ensureControllerVisible(musicController)
-                HookRuntime.info("Exposed active music controller to Notification Center consumer")
+                HookRuntime.runtimeInfo { "Exposed active music controller to Notification Center consumer" }
                 ArrayList<Any?>(original.size + 1).apply {
                     addAll(original)
                     add(musicController)
@@ -755,11 +844,11 @@ internal object MusicMediaRowHook {
         MusicSeedlingPlayback.reconcileForNotificationCenter()
         val manager = customRowManager
         val rowVisible = manager?.let(::hasVisibleMusicRow) == true
-        HookRuntime.info(
+        HookRuntime.runtimeInfo {
             "Notification panel refresh: reason=$reason, eligible=${MusicSeedlingPlayback.eligibleMediaCount()}, " +
                 "managerKnown=${manager != null}, rowVisible=$rowVisible, " +
                 "seedling=${MusicSeedlingPlayback.hasSeedlingInstance()}"
-        )
+        }
         // Rebuild only when no music row is actually visible. Re-running the native list update
         // while its carousel is visible can reset the selected player; an invisible cached row
         // must not suppress the panel-open refresh.
@@ -777,7 +866,7 @@ internal object MusicMediaRowHook {
                 row.requestLayout()
                 row.invalidate()
             }
-        }.onFailure { HookRuntime.warn("Cannot expose active Notification Center music controller", it) }
+        }.onFailure { HookRuntime.runtimeWarn(it) { "Cannot expose active Notification Center music controller" } }
     }
 
     private fun installPreservePlayingEntry(loader: ClassLoader, manager: Class<*>) {
@@ -790,107 +879,148 @@ internal object MusicMediaRowHook {
                 "setCustomContainerControllerList", List::class.java, Boolean::class.javaPrimitiveType,
             )
             HookRuntime.deoptimize(setter)
-            HookRuntime.hook("systemui:keep-playing-notification-center-entry", setter, XposedInterface.Hooker { chain ->
-                chain.thisObject?.let { customRowManager = it }
-                if (!notificationPanelForeground) {
-                    if (!MusicSeedlingPlayback.hasEligibleMediaSession()) cachedMusicEntry = null
-                    return@Hooker chain.proceed()
-                }
-                val rawIncoming = chain.args.getOrNull(0) as? List<*> ?: return@Hooker chain.proceed()
-                val updateResources = chain.args.getOrNull(1) as? Boolean ?: false
-                val receiver = chain.thisObject ?: return@Hooker chain.proceed()
-                val existingEntries = runCatching {
-                    Reflect.field(receiver, "customRowEntryList") as? List<*>
-                }.getOrNull().orEmpty()
-                val existingMusicOrder = existingEntries
-                    .mapIndexedNotNull { index, entry ->
-                        if (!isMusicEntry(entry, companion, classifier)) return@mapIndexedNotNull null
-                        musicEntryKey(entry)?.let { key -> key to index }
+            HookRuntime.hook(
+                "systemui:keep-playing-notification-center-entry",
+                setter,
+                XposedInterface.Hooker { chain ->
+                    chain.thisObject?.let { customRowManager = it }
+                    if (!notificationPanelForeground) {
+                        if (!MusicSeedlingPlayback.hasEligibleMediaSession()) cachedMusicEntry = null
+                        return@Hooker chain.proceed()
                     }
-                    .toMap()
+                    val rawIncoming = chain.args.getOrNull(0) as? List<*> ?: return@Hooker chain.proceed()
+                    val updateResources = chain.args.getOrNull(1) as? Boolean ?: false
+                    val receiver = chain.thisObject ?: return@Hooker chain.proceed()
+                    val existingEntries = runCatching {
+                        Reflect.field(receiver, "customRowEntryList") as? List<*>
+                    }.getOrNull().orEmpty()
+                    cachedMusicEntry?.takeIf(::isRetiredMusicEntry)?.let { cachedMusicEntry = null }
+                    val existingMusicEntries = existingEntries.filter {
+                        isMusicEntry(it, companion, classifier) && !isRetiredMusicEntry(it)
+                    }
+                    val existingMusicOrder = existingEntries
+                        .mapIndexedNotNull { index, entry ->
+                            if (!isMusicEntry(entry, companion, classifier) || isRetiredMusicEntry(entry)) {
+                                return@mapIndexedNotNull null
+                            }
+                            musicEntryKey(entry)?.let { key -> key to index }
+                        }
+                        .toMap()
 
-                // serviceId identifies the card type, not an individual media session. Keep
-                // separate players and remove only duplicate copies of the same row key.
-                val musicEntries = ArrayList<Any?>()
-                val seenMusicKeys = HashSet<String>()
-                rawIncoming.forEach { entry ->
-                    if (isMusicEntry(entry, companion, classifier)) {
-                        val key = musicEntryKey(entry)
-                        if (key == null || seenMusicKeys.add(key)) musicEntries.add(entry)
+                    // serviceId identifies the card type, not an individual media session. Keep
+                    // separate players and remove only duplicate copies of the same row key.
+                    val musicEntries = ArrayList<Any?>()
+                    val seenMusicKeys = HashSet<String>()
+                    rawIncoming.forEach { entry ->
+                        if (isMusicEntry(entry, companion, classifier)) {
+                            val key = musicEntryKey(entry)
+                            if (!isRetiredMusicEntry(entry) && (key == null || seenMusicKeys.add(key))) {
+                                musicEntries.add(entry)
+                            }
+                        }
                     }
-                }
-                val orderedMusicEntries = musicEntries.withIndex()
-                    .sortedWith(compareBy<IndexedValue<Any?>>(
-                        { musicEntryKey(it.value)?.let(existingMusicOrder::get) ?: Int.MAX_VALUE },
-                        { it.index },
-                    ))
-                    .map { it.value }
-                val orderedMusicIterator = orderedMusicEntries.iterator()
-                val incoming = ArrayList<Any?>(rawIncoming.size + orderedMusicEntries.size)
-                rawIncoming.forEach { entry ->
-                    if (isMusicEntry(entry, companion, classifier) && musicEntryKey(entry) in existingMusicOrder) {
-                        // Keep a surviving card in its old full-list slot. New cards are
-                        // appended below so they cannot inherit another player's slot.
-                        if (orderedMusicIterator.hasNext()) incoming.add(orderedMusicIterator.next())
+                    val orderedMusicEntries = musicEntries.withIndex()
+                        .sortedWith(compareBy<IndexedValue<Any?>>(
+                            { musicEntryKey(it.value)?.let(existingMusicOrder::get) ?: Int.MAX_VALUE },
+                            { it.index },
+                        ))
+                        .map { it.value }
+                    val orderedMusicIterator = orderedMusicEntries.iterator()
+                    val insertedExistingMusicKeys = HashSet<String>()
+                    val incoming = ArrayList<Any?>(rawIncoming.size + orderedMusicEntries.size)
+                    rawIncoming.forEach { entry ->
+                        if (isMusicEntry(entry, companion, classifier)) {
+                            if (isRetiredMusicEntry(entry)) return@forEach
+                            val key = musicEntryKey(entry)
+                            if (
+                                key != null && key in existingMusicOrder &&
+                                insertedExistingMusicKeys.add(key) && orderedMusicIterator.hasNext()
+                            ) {
+                                // Keep a surviving card in its old full-list slot. New cards are
+                                // appended below so they cannot inherit another player's slot.
+                                incoming.add(orderedMusicIterator.next())
+                            }
+                        } else {
+                            incoming.add(entry)
+                        }
+                    }
+                    while (orderedMusicIterator.hasNext()) incoming.add(orderedMusicIterator.next())
+                    val incomingChanged = incoming.size != rawIncoming.size || incoming.indices.any { index ->
+                        incoming[index] !== rawIncoming[index]
+                    }
+                    val incomingMusicEntry = incoming.firstOrNull { isMusicEntry(it, companion, classifier) }
+                    if (HookRuntime.isLogsEnabled()) {
+                        val existingMusicKeys = existingEntries.filter { isMusicEntry(it, companion, classifier) }
+                            .mapNotNull(::musicEntryKey).joinToString(",") { mediaKeyForLog(it) }
+                        val incomingMusicKeys = incoming.filter { isMusicEntry(it, companion, classifier) }
+                            .mapNotNull(::musicEntryKey).joinToString(",") { mediaKeyForLog(it) }
+                        HookRuntime.info(
+                            "Notification Center row list: existing=[$existingMusicKeys], " +
+                                "incoming=[$incomingMusicKeys], " +
+                                "changed=$incomingChanged, updateResources=$updateResources, " +
+                                "eligible=${MusicSeedlingPlayback.eligibleMediaCount()}",
+                        )
+                    }
+                    fun proceedWithIncoming(): Any? = if (incomingChanged) {
+                        chain.proceed(arrayOf(incoming, updateResources))
                     } else {
-                        incoming.add(entry)
+                        chain.proceed()
                     }
-                }
-                while (orderedMusicIterator.hasNext()) incoming.add(orderedMusicIterator.next())
-                val incomingChanged = incoming.size != rawIncoming.size || incoming.indices.any { index ->
-                    incoming[index] !== rawIncoming[index]
-                }
-                val incomingMusicEntry = incoming.firstOrNull { isMusicEntry(it, companion, classifier) }
-                if (HookRuntime.isLogsEnabled()) {
-                    val existingMusicKeys = existingEntries.filter { isMusicEntry(it, companion, classifier) }
-                        .mapNotNull(::musicEntryKey).joinToString(",") { diagnosticKey(it) }
-                    val incomingMusicKeys = incoming.filter { isMusicEntry(it, companion, classifier) }
-                        .mapNotNull(::musicEntryKey).joinToString(",") { diagnosticKey(it) }
-                    HookRuntime.info(
-                        "Notification Center row list: existing=[$existingMusicKeys], incoming=[$incomingMusicKeys], " +
-                            "changed=$incomingChanged, updateResources=$updateResources, " +
-                            "eligible=${MusicSeedlingPlayback.eligibleMediaCount()}"
-                    )
-                }
-                fun proceedWithIncoming(): Any? = if (incomingChanged) {
-                    chain.proceed(arrayOf(incoming, updateResources))
-                } else {
-                    chain.proceed()
-                }
-                val existingMusicEntry = existingEntries.firstOrNull { isMusicEntry(it, companion, classifier) }
-                    ?: incomingMusicEntry
-                if (existingMusicEntry != null) cachedMusicEntry = existingMusicEntry
-                val eligibleMedia = MusicSeedlingPlayback.hasEligibleMediaSession()
-                if (updateResources || !eligibleMedia) {
-                    if (!eligibleMedia) cachedMusicEntry = null
-                    val result = proceedWithIncoming()
-                    if (eligibleMedia && !updateResources) revealActiveMusicRow(receiver, companion, classifier)
-                    return@Hooker result
-                }
-                // This hook is entered only while the exact NOTIFICATION_PANEL is expanded.
-                // StatusBarStateController can lag the shade transition and must not veto the
-                // notification-row retention decision.
-                val activeMediaEntry = existingMusicEntry ?: cachedMusicEntry ?: return@Hooker proceedWithIncoming()
-                val mediaKey = Reflect.call(activeMediaEntry, "getKey")
-                if (incomingMusicEntry === activeMediaEntry || incoming.any { entry ->
-                        runCatching { Reflect.call(entry!!, "getKey") == mediaKey }.getOrDefault(false)
+                    val existingMusicEntry = existingMusicEntries.firstOrNull() ?: incomingMusicEntry
+                    if (existingMusicEntry != null) cachedMusicEntry = existingMusicEntry
+                    val eligibleMedia = MusicSeedlingPlayback.hasEligibleMediaSession()
+                    if (updateResources || !eligibleMedia) {
+                        if (!eligibleMedia) cachedMusicEntry = null
+                        val result = proceedWithIncoming()
+                        if (eligibleMedia && !updateResources) revealActiveMusicRow(receiver, companion, classifier)
+                        return@Hooker result
                     }
-                ) {
-                    logRestoreState { "setter:incomingMusic=${incomingMusicEntry != null},alreadyPresent=true,eligible=true,panel=notification" }
-                    val result = proceedWithIncoming()
+                    // This hook is entered only while the exact NOTIFICATION_PANEL is expanded.
+                    // StatusBarStateController can lag the shade transition and must not veto the
+                    // notification-row retention decision.
+                    val retainedCandidates = ArrayList<Any?>()
+                    val retainedKeys = HashSet<String>()
+                    (existingMusicEntries + listOfNotNull(cachedMusicEntry)).forEach { entry ->
+                        if (!isMusicEntry(entry, companion, classifier) || isRetiredMusicEntry(entry)) {
+                            return@forEach
+                        }
+                        val key = musicEntryKey(entry)
+                        if (key == null || retainedKeys.add(key)) retainedCandidates.add(entry)
+                    }
+                    val incomingMusicKeys = incoming.asSequence()
+                        .filter { isMusicEntry(it, companion, classifier) }
+                        .mapNotNull(::musicEntryKey)
+                        .toHashSet()
+                    val missingEntries = retainedCandidates.filter { entry ->
+                        val key = musicEntryKey(entry)
+                        key == null || key !in incomingMusicKeys
+                    }
+                    if (missingEntries.isEmpty()) {
+                        logRestoreState {
+                            "setter:incomingMusic=${incomingMusicEntry != null},alreadyPresent=true," +
+                                "retained=${retainedCandidates.size},eligible=true,panel=notification"
+                        }
+                        val result = proceedWithIncoming()
+                        revealActiveMusicRow(receiver, companion, classifier)
+                        return@Hooker result
+                    }
+                    val merged = ArrayList<Any?>(incoming.size + missingEntries.size).apply {
+                        addAll(incoming)
+                        addAll(missingEntries)
+                    }
+                    HookRuntime.runtimeInfo {
+                        "Restored ${missingEntries.size} eligible music entries through " +
+                            "native Notification Center list setter"
+                    }
+                    logRestoreState {
+                        "setter:incomingMusic=${incomingMusicEntry != null},restored=${missingEntries.size}," +
+                            "eligible=true,panel=notification"
+                    }
+                    val result = chain.proceed(arrayOf(merged, updateResources))
                     revealActiveMusicRow(receiver, companion, classifier)
-                    return@Hooker result
-                }
-                val merged = ArrayList<Any?>(incoming.size + 1).apply {
-                    addAll(incoming)
-                    add(activeMediaEntry)
-                }
-                HookRuntime.info("Restored eligible music entry through native Notification Center list setter")
-                logRestoreState { "setter:incomingMusic=${incomingMusicEntry != null},restored=true,eligible=true,panel=notification" }
-                val result = chain.proceed(arrayOf(merged, updateResources))
-                revealActiveMusicRow(receiver, companion, classifier)
-                result
-            })
+                    result
+                },
+            )
         }.onFailure { HookRuntime.installWarn("Playing media row retention hook unavailable", it) }
     }
 
@@ -933,7 +1063,6 @@ internal object MusicMediaRowHook {
 
                 val result = chain.proceed()
                 if (!isMusicClick) return@Hooker result
-                val rowEntry = retainedEntry ?: return@Hooker result
 
                 MusicSeedlingPlayback.scheduleActiveCardRefresh("music-card-app-launch", 150L)
                 result
@@ -964,24 +1093,33 @@ internal object MusicMediaRowHook {
         }
         val posted = mainHandler.post {
             try {
-            runCatching {
-                if (!isNotificationCenterForeground() || !MusicSeedlingPlayback.hasEligibleMediaSession()) return@runCatching
-                val controllers = Reflect.field(manager, "customList") as? List<*> ?: return@runCatching
-                val controller = controllers.firstOrNull { item ->
-                    runCatching { isMusicEntry(Reflect.call(requireNotNull(item), "getEntry"), companion, classifier) }
-                        .getOrDefault(false)
-                } ?: return@runCatching
-                val row = Reflect.call(controller, "getOplusCustomRow") as? View ?: return@runCatching
-                val oldVisibility = row.visibility
-                if (oldVisibility != View.VISIBLE) {
-                    row.visibility = View.VISIBLE
-                    row.alpha = 1f
-                    runCatching { Reflect.call(row, "resetTranslation") }
-                    row.requestLayout()
-                    row.invalidate()
-                    HookRuntime.info("Restored active Notification Center music row visibility: oldVisibility=$oldVisibility")
+                runCatching {
+                    if (!isNotificationCenterForeground() || !MusicSeedlingPlayback.hasEligibleMediaSession()) {
+                        return@runCatching
+                    }
+                    val controllers = Reflect.field(manager, "customList") as? List<*> ?: return@runCatching
+                    val controller = controllers.firstOrNull { item ->
+                        runCatching {
+                            isMusicEntry(Reflect.call(requireNotNull(item), "getEntry"), companion, classifier)
+                        }.getOrDefault(false)
+                    } ?: return@runCatching
+                    val row = Reflect.call(controller, "getOplusCustomRow") as? View ?: return@runCatching
+                    val oldVisibility = row.visibility
+                    if (oldVisibility != View.VISIBLE) {
+                        row.visibility = View.VISIBLE
+                        row.alpha = 1f
+                        runCatching { Reflect.call(row, "resetTranslation") }
+                        row.requestLayout()
+                        row.invalidate()
+                        HookRuntime.runtimeInfo {
+                            "Restored active Notification Center music row visibility: " +
+                                "oldVisibility=$oldVisibility"
+                        }
+                        MediaCoverAppearanceHook.repairVisibleBackgroundMargins("music-card-row-visible")
+                    }
+                }.onFailure {
+                    HookRuntime.runtimeWarn(it) { "Cannot restore active Notification Center music row visibility" }
                 }
-            }.onFailure { HookRuntime.warn("Cannot restore active Notification Center music row visibility", it) }
             } finally {
                 synchronized(revealLock) { revealPending = false }
             }
@@ -1026,7 +1164,8 @@ internal object MusicMediaRowHook {
 /** Routes the OEM lock-screen album-art callback through SystemUI's immersive-state path. */
 internal object MusicLockScreenCoverHook {
     private const val LISTENER =
-        "com.oplus.systemui.notification.lockscreen.seedling.CapsuleSeedingData\$Companion\$setupSeedlingClickListener\$1"
+        "com.oplus.systemui.notification.lockscreen.seedling.CapsuleSeedingData" +
+            "\$Companion\$setupSeedlingClickListener\$1"
     private const val CAPSULE_ITEM_CLICK_CALLBACK =
         "com.oplus.systemui.notification.lockscreen.statemanager.LockScreenNotificationViewBinder\$initCapsule\$1"
     private const val CAPSULE_SEEDLING_DATA =
@@ -1044,14 +1183,19 @@ internal object MusicLockScreenCoverHook {
                 val view = chain.args.getOrNull(0) as? View
                 val key = findMusicServiceKey(receiver)
                 if (HookRuntime.isLogsEnabled()) {
+                    val viewId = view?.id?.let { "0x${it.toString(16)}" } ?: "unknown"
                     HookRuntime.info(
-                        "Lock-screen capsule click observed: viewId=${view?.id?.let { "0x${it.toString(16)}" } ?: "unknown"}, " +
-                            "listenerKeyPresent=${key != null}"
+                        "Lock-screen capsule click observed: viewId=$viewId, " +
+                            "listenerKeyPresent=${key != null}",
                     )
                 }
                 if (key == null) return@Hooker chain.proceed()
                 val requested = MusicMediaRowHook.requestLockScreenImmersiveState(key)
-                if (!requested) HookRuntime.warn("Music lock-screen cover matched, but immersive request was unavailable")
+                if (!requested) {
+                    HookRuntime.runtimeWarn {
+                        "Music lock-screen cover matched, but immersive request was unavailable"
+                    }
+                }
                 chain.proceed()
             })
             installCapsuleItemClick(loader)
@@ -1076,15 +1220,18 @@ internal object MusicLockScreenCoverHook {
                     if (!isMusicService(serviceId)) return@Hooker chain.proceed()
                     val key = runCatching { Reflect.call(entry, "getKey") as? String }.getOrNull()
                         ?: return@Hooker chain.proceed()
-                    HookRuntime.info(
-                        "Lock-screen capsule item click observed: musicSeedling=true, key=${diagnosticKey(key)}"
-                    )
+                    HookRuntime.runtimeInfo {
+                        "Lock-screen capsule item click observed: musicSeedling=true, key=${mediaKeyForLog(key)}"
+                    }
                     if (MusicMediaRowHook.requestLockScreenImmersiveState(key)) {
                         // The OEM callback can start the app. The immersive request already
                         // dispatched the native lock-screen transition for this exact row.
                         null
                     } else {
-                        HookRuntime.warn("Music capsule item click could not dispatch immersive request; keeping OEM behavior")
+                        HookRuntime.runtimeWarn {
+                            "Music capsule item click could not dispatch immersive request; " +
+                                "keeping OEM behavior"
+                        }
                         chain.proceed()
                     }
                 })
@@ -1102,7 +1249,8 @@ internal object MusicLockScreenCoverHook {
 
 internal object MusicMediaRowClassifier {
     internal const val ROW_CLASS = "com.oplus.systemui.statusbar.notification.customcard.OplusCustomRow"
-    internal const val COMPANION_CLASS = "com.oplus.systemui.statusbar.notification.customcard.OplusCustomRow\$Companion"
+    internal const val COMPANION_CLASS =
+        "com.oplus.systemui.statusbar.notification.customcard.OplusCustomRow\$Companion"
     internal fun isNotificationCenterMediaRow(
         view: Any,
         companion: Any,
@@ -1150,7 +1298,7 @@ internal object MusicSwipeDismissHook {
             HookRuntime.hook("systemui:music-row-gesture-enabled", canDrag, XposedInterface.Hooker { chain ->
                 val row = chain.args.getOrNull(1) as? View ?: return@Hooker chain.proceed()
                 if (MusicMediaRowClassifier.isMusicMediaRow(row, companion, classifier)) {
-                    HookRuntime.info("Enabled OEM gesture handling for media row")
+                    HookRuntime.runtimeInfo { "Enabled OEM gesture handling for media row" }
                     true
                 } else chain.proceed()
             })
@@ -1164,14 +1312,17 @@ internal object MusicSwipeDismissHook {
             })
 
             val stackController = Reflect.findClass(
-                "com.oplus.systemui.statusbar.notification.stack.NotificationStackScrollLayoutControllerExtImpl", loader,
+                "com.oplus.systemui.statusbar.notification.stack.NotificationStackScrollLayoutControllerExtImpl",
+                loader,
             )
             val dismissible = stackController.getDeclaredMethod("canOplusCustomRowBeDismiss", View::class.java)
             HookRuntime.deoptimize(dismissible)
             HookRuntime.hook("systemui:music-row-dismissible", dismissible, XposedInterface.Hooker { chain ->
                 val row = chain.args.getOrNull(0) as? View ?: return@Hooker chain.proceed()
                 if (MusicMediaRowClassifier.isNotificationCenterMediaRow(row, companion, classifier)) {
-                    HookRuntime.info("Kept Notification Center media row swipeable; OEM delete affordance disabled")
+                    HookRuntime.runtimeInfo {
+                        "Kept Notification Center media row swipeable; OEM delete affordance disabled"
+                    }
                     false
                 }
                 else chain.proceed()
@@ -1184,11 +1335,13 @@ internal object MusicSwipeDismissHook {
             HookRuntime.deoptimize(dismiss)
             HookRuntime.hook("systemui:music-swipe-dismiss-commit", dismiss, XposedInterface.Hooker { chain ->
                 val row = chain.args.getOrNull(0) as? View ?: return@Hooker chain.proceed()
-                val reason = chain.args.getOrNull(1) as? String
                 if (MusicMediaRowClassifier.isNotificationCenterMediaRow(row, companion, classifier)) {
-                    HookRuntime.info("Blocked Notification Center media row dismissal; reason=$reason")
+                    HookRuntime.runtimeInfo {
+                        val reason = chain.args.getOrNull(1) as? String
+                        "Blocked Notification Center media row dismissal; reason=$reason"
+                    }
                     runCatching { Reflect.call(row, "resetTranslation") }
-                        .onFailure { HookRuntime.warn("Cannot restore swiped media row position", it) }
+                        .onFailure { HookRuntime.runtimeWarn(it) { "Cannot restore swiped media row position" } }
                     row.alpha = 1f
                     row.visibility = View.VISIBLE
                     null

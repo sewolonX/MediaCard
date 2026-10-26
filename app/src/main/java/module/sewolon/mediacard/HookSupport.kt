@@ -1,7 +1,7 @@
 package module.sewolon.mediacard
 
-import android.util.Log
 import android.content.SharedPreferences
+import android.util.Log
 import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedModule
 import java.lang.reflect.Executable
@@ -9,9 +9,11 @@ import java.lang.reflect.Field
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
+import kotlin.jvm.javaObjectType
 
-/** Compact identifier for correlating log events without printing media keys. */
-internal fun diagnosticKey(value: String): String = Integer.toHexString(value.hashCode())
+/** Keep the exact media key in local troubleshooting logs so events can be correlated. */
+internal fun mediaKeyForLog(value: String): String = value
 
 internal object HookRuntime {
     @Volatile private var module: XposedModule? = null
@@ -19,12 +21,21 @@ internal object HookRuntime {
     @Volatile private var settings = HookFeatureConfig.Settings()
     @Volatile private var preferences: SharedPreferences? = null
     @Volatile private var preferencesListener: SharedPreferences.OnSharedPreferenceChangeListener? = null
+    private val settingsListeners = CopyOnWriteArrayList<(HookFeatureConfig.Settings) -> Unit>()
 
     fun attach(module: XposedModule) {
         this.module = module
     }
 
     fun isLogsEnabled(): Boolean = settings.logsEnabled
+
+    fun settingsSnapshot(): HookFeatureConfig.Settings = settings
+
+    fun addSettingsListener(listener: (HookFeatureConfig.Settings) -> Unit) {
+        settingsListeners.addIfAbsent(listener)
+        runCatching { listener(settings) }
+            .onFailure { installWarn("Hook settings listener failed", it) }
+    }
 
     fun attachPreferences(preferences: SharedPreferences) {
         synchronized(this) {
@@ -39,16 +50,31 @@ internal object HookRuntime {
                         HookFeatureConfig.MASTER,
                         HookFeatureConfig.SWIPE,
                         HookFeatureConfig.LOGS,
+                        HookFeatureConfig.MEDIA_COVER_MODE,
+                        HookFeatureConfig.MEDIA_COVER_ADAPTIVE_WIDTH,
                     )
                 ) {
-                    settings = HookFeatureConfig.read(changed)
-                    info("Hook settings refreshed${key?.let { ": $it" } ?: ""}")
+                    val updated = HookFeatureConfig.read(changed)
+                    publishSettings(updated)
+                    // Keep setting refresh events visible when the log switch itself is off.
+                    hotReloadInfo(
+                        "Hook settings refreshed${key?.let { ": $it" } ?: ""}; " +
+                            "logsEnabled=${updated.logsEnabled}",
+                    )
                 }
             }
             preferencesListener = listener
             runCatching { preferences.registerOnSharedPreferenceChangeListener(listener) }
                 .onFailure { installWarn("Cannot observe remote hook settings", it) }
-            settings = HookFeatureConfig.read(preferences)
+            publishSettings(HookFeatureConfig.read(preferences))
+        }
+    }
+
+    private fun publishSettings(updated: HookFeatureConfig.Settings) {
+        settings = updated
+        settingsListeners.forEach { listener ->
+            runCatching { listener(updated) }
+                .onFailure { installWarn("Hook settings listener failed", it) }
         }
     }
 
@@ -59,6 +85,10 @@ internal object HookRuntime {
 
     fun forgetInstalledHook(id: String) {
         installed.remove(id)
+    }
+
+    fun clearInstalledHooks() {
+        installed.clear()
     }
 
     fun hook(key: String, executable: Executable, hooker: XposedInterface.Hooker) {
@@ -78,15 +108,38 @@ internal object HookRuntime {
         }
     }
 
+    // Eager APIs are for already-gated diagnostics and hook-installation paths.
     fun info(message: String) = write(Log.INFO, message, null)
     fun warn(message: String, error: Throwable? = null) = write(Log.WARN, message, error)
 
-    fun installInfo(message: String) = write(Log.INFO, message, null, always = true)
-    fun installWarn(message: String, error: Throwable? = null) =
-        write(Log.WARN, message, error, always = true)
+    /** Build runtime diagnostics only while the user-facing log switch is enabled. */
+    fun runtimeInfo(message: () -> String) {
+        if (!settings.logsEnabled) return
+        write(Log.INFO, message(), null)
+    }
 
-    private fun write(priority: Int, message: String, error: Throwable?, always: Boolean = false) {
-        if (!always && !settings.logsEnabled) return
+    fun runtimeWarn(error: Throwable? = null, message: () -> String) {
+        if (!settings.logsEnabled) return
+        write(Log.WARN, message(), error)
+    }
+
+    // Hook installation and runtime diagnostics follow the user-facing log switch too.
+    fun installInfo(message: String) = info(message)
+    fun installWarn(message: String, error: Throwable? = null) =
+        warn(message, error)
+
+    // Keep lifecycle and remotely-applied setting diagnostics visible when logs are off.
+    fun hotReloadInfo(message: String) = write(Log.INFO, message, null, keepWhenDisabled = true)
+    fun hotReloadWarn(message: String, error: Throwable? = null) =
+        write(Log.WARN, message, error, keepWhenDisabled = true)
+
+    private fun write(
+        priority: Int,
+        message: String,
+        error: Throwable?,
+        keepWhenDisabled: Boolean = false,
+    ) {
+        if (!keepWhenDisabled && !settings.logsEnabled) return
         val active = module
         if (active != null) {
             runCatching { active.log(priority, "MediaCard-LSP", message, error) }
@@ -164,14 +217,14 @@ internal object Reflect {
     )
 
     private fun boxed(type: Class<*>): Class<*> = when (type) {
-        java.lang.Boolean.TYPE -> java.lang.Boolean::class.java
-        java.lang.Byte.TYPE -> java.lang.Byte::class.java
-        java.lang.Short.TYPE -> java.lang.Short::class.java
-        java.lang.Integer.TYPE -> java.lang.Integer::class.java
-        java.lang.Long.TYPE -> java.lang.Long::class.java
-        java.lang.Float.TYPE -> java.lang.Float::class.java
-        java.lang.Double.TYPE -> java.lang.Double::class.java
-        java.lang.Character.TYPE -> java.lang.Character::class.java
+        java.lang.Boolean.TYPE -> Boolean::class.javaObjectType
+        java.lang.Byte.TYPE -> Byte::class.javaObjectType
+        java.lang.Short.TYPE -> Short::class.javaObjectType
+        java.lang.Integer.TYPE -> Int::class.javaObjectType
+        java.lang.Long.TYPE -> Long::class.javaObjectType
+        java.lang.Float.TYPE -> Float::class.javaObjectType
+        java.lang.Double.TYPE -> Double::class.javaObjectType
+        java.lang.Character.TYPE -> Char::class.javaObjectType
         else -> type
     }
 }

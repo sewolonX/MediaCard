@@ -7,6 +7,7 @@ import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -19,6 +20,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -31,7 +33,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.core.view.WindowCompat
 import java.util.concurrent.TimeUnit
 import top.yukonga.miuix.kmp.basic.BasicComponent
@@ -41,8 +42,9 @@ import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.basic.Switch
 import top.yukonga.miuix.kmp.basic.TopAppBar
 import top.yukonga.miuix.kmp.basic.rememberTopAppBarState
-import top.yukonga.miuix.kmp.theme.MiuixTheme
+import top.yukonga.miuix.kmp.preference.OverlayDropdownPreference
 import top.yukonga.miuix.kmp.theme.ColorSchemeMode
+import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.ThemeController
 import top.yukonga.miuix.kmp.utils.overScrollVertical
 import top.yukonga.miuix.kmp.utils.scrollEndHaptic
@@ -81,6 +83,7 @@ class SettingsActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         synchronized(nativeMediaLock) { settingsPageVisible = true }
+        SettingsService.refreshScope()
         refreshNativeMediaControls()
     }
 
@@ -297,8 +300,9 @@ private fun MediaCardApp(
     nativeMediaControls: NativeMediaControlsUiState,
     onNativeMediaControlsChange: (Boolean) -> Unit,
 ) {
-    var connection by remember { mutableStateOf(SettingsService.Connection()) }
-    var hookSettings by remember { mutableStateOf(HookFeatureConfig.Settings()) }
+    val initialConnection = remember { SettingsService.currentConnection() }
+    var connection by remember { mutableStateOf(initialConnection) }
+    var hookSettings by remember { mutableStateOf(HookFeatureConfig.read(initialConnection.preferences)) }
     val callback: (SettingsService.Connection) -> Unit = { next ->
         connection = next
         hookSettings = HookFeatureConfig.read(next.preferences)
@@ -323,6 +327,12 @@ private fun MediaCardApp(
         hookSettings = HookFeatureConfig.withValue(hookSettings, key, value)
         runCatching { prefs?.edit()?.putBoolean(key, value)?.apply() }
     }
+    val updateMediaCoverMode: (HookFeatureConfig.MediaCoverMode) -> Unit = { mode ->
+        hookSettings = HookFeatureConfig.withMediaCoverMode(hookSettings, mode)
+        runCatching {
+            prefs?.edit()?.putString(HookFeatureConfig.MEDIA_COVER_MODE, mode.storedValue)?.apply()
+        }
+    }
 
     val appBarState = rememberTopAppBarState()
     val scrollBehavior = MiuixScrollBehavior(state = appBarState)
@@ -344,8 +354,10 @@ private fun MediaCardApp(
         SettingsPage(
             modifier = Modifier.fillMaxSize().padding(padding),
             prefs = prefs,
+            scopeSufficient = connection.scopeSufficient,
             settings = hookSettings,
             onSettingChange = updateHookSetting,
+            onMediaCoverModeChange = updateMediaCoverMode,
             nativeMediaControls = nativeMediaControls,
             onNativeMediaControlsChange = onNativeMediaControlsChange,
         )
@@ -356,8 +368,10 @@ private fun MediaCardApp(
 private fun SettingsPage(
     modifier: Modifier = Modifier,
     prefs: SharedPreferences?,
+    scopeSufficient: Boolean?,
     settings: HookFeatureConfig.Settings,
     onSettingChange: (String, Boolean) -> Unit,
+    onMediaCoverModeChange: (HookFeatureConfig.MediaCoverMode) -> Unit,
     nativeMediaControls: NativeMediaControlsUiState,
     onNativeMediaControlsChange: (Boolean) -> Unit,
 ) {
@@ -365,6 +379,21 @@ private fun SettingsPage(
     val performanceWarning = stringResource(R.string.logs_performance_warning)
     val noRootMessage = stringResource(R.string.settings_native_media_controls_no_root)
     val settingUnavailableMessage = stringResource(R.string.settings_native_media_controls_unavailable)
+    // Remote preferences can exist even when one of the target packages is unchecked.
+    // Only enable hook controls after both required scopes have been confirmed.
+    val hookSettingsEnabled = prefs != null && scopeSufficient == true
+    val coverModeItems = listOf(
+        stringResource(R.string.settings_media_cover_small),
+        stringResource(R.string.settings_media_cover_large),
+        stringResource(R.string.settings_media_cover_fill_background),
+        stringResource(R.string.settings_media_cover_blurred_background),
+    )
+    val coverModeSummaryId = when (settings.mediaCoverMode) {
+        HookFeatureConfig.MediaCoverMode.SMALL -> R.string.settings_media_cover_small_summary
+        HookFeatureConfig.MediaCoverMode.LARGE -> R.string.settings_media_cover_large_summary
+        HookFeatureConfig.MediaCoverMode.FILL_BACKGROUND -> R.string.settings_media_cover_fill_background_summary
+        HookFeatureConfig.MediaCoverMode.BLURRED_BACKGROUND -> R.string.settings_media_cover_blurred_background_summary
+    }
     var launcherHidden by remember { mutableStateOf(isLauncherHidden(context)) }
 
     LazyColumn(
@@ -376,18 +405,29 @@ private fun SettingsPage(
     ) {
         item {
             Card(Modifier.fillMaxWidth()) {
+                if (scopeSufficient == false) {
+                    BasicComponent(
+                        modifier = Modifier.fillMaxWidth(),
+                        title = stringResource(R.string.settings_scope_incomplete),
+                        summary = stringResource(R.string.settings_scope_incomplete_summary),
+                        enabled = false,
+                        onClick = {},
+                    )
+                }
                 SettingsToggle(
                     titleId = R.string.settings_master,
                     summaryId = R.string.settings_master_summary,
                     checked = settings.master,
-                    enabled = prefs != null,
+                    enabled = hookSettingsEnabled,
+                    switchAnimationKey = hookSettingsEnabled,
                     onChange = { onSettingChange(HookFeatureConfig.MASTER, it) },
                 )
                 SettingsToggle(
                     titleId = R.string.settings_swipe,
                     summaryId = R.string.settings_swipe_summary,
                     checked = settings.swipe,
-                    enabled = prefs != null && settings.master,
+                    enabled = hookSettingsEnabled && settings.master,
+                    switchAnimationKey = hookSettingsEnabled,
                     onChange = { onSettingChange(HookFeatureConfig.SWIPE, it) },
                 )
                 SettingsToggle(
@@ -396,6 +436,7 @@ private fun SettingsPage(
                     checked = nativeMediaControls.enabled == true,
                     enabled = nativeMediaControls.rootAvailable == true &&
                         nativeMediaControls.enabled != null && !nativeMediaControls.loading,
+                    switchAnimationKey = nativeMediaControls.enabled != null,
                     disabledClick = {
                         when {
                             nativeMediaControls.rootAvailable == false ->
@@ -411,11 +452,34 @@ private fun SettingsPage(
         }
         item {
             Card(Modifier.fillMaxWidth()) {
+                OverlayDropdownPreference(
+                    title = stringResource(R.string.settings_media_cover_size),
+                    summary = stringResource(coverModeSummaryId),
+                    items = coverModeItems,
+                    selectedIndex = settings.mediaCoverMode.ordinal,
+                    enabled = hookSettingsEnabled && settings.master,
+                    onSelectedIndexChange = { index ->
+                        HookFeatureConfig.MediaCoverMode.values().getOrNull(index)?.let(onMediaCoverModeChange)
+                    },
+                )
+                SettingsToggle(
+                    titleId = R.string.settings_media_cover_adaptive_width,
+                    summaryId = R.string.settings_media_cover_adaptive_width_summary,
+                    checked = settings.mediaCoverAdaptiveWidth,
+                    enabled = hookSettingsEnabled && settings.master && settings.mediaCoverMode.supportsAdaptiveWidth,
+                    switchAnimationKey = hookSettingsEnabled,
+                    onChange = { onSettingChange(HookFeatureConfig.MEDIA_COVER_ADAPTIVE_WIDTH, it) },
+                )
+            }
+        }
+        item {
+            Card(Modifier.fillMaxWidth()) {
                 SettingsToggle(
                     titleId = R.string.settings_logs,
                     summaryId = R.string.settings_logs_summary,
                     checked = settings.logsEnabled,
-                    enabled = prefs != null,
+                    enabled = hookSettingsEnabled,
+                    switchAnimationKey = hookSettingsEnabled,
                     onChange = { enabled ->
                         val wasEnabled = settings.logsEnabled
                         onSettingChange(HookFeatureConfig.LOGS, enabled)
@@ -444,6 +508,7 @@ private fun SettingsToggle(
     summaryId: Int,
     checked: Boolean,
     enabled: Boolean,
+    switchAnimationKey: Any? = null,
     disabledClick: (() -> Unit)? = null,
     onChange: (Boolean) -> Unit,
 ) {
@@ -458,14 +523,16 @@ private fun SettingsToggle(
         },
         endActions = {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Switch(
-                    checked = checked,
-                    onCheckedChange = { checkedValue ->
-                        if (enabled) onChange(checkedValue) else disabledClick?.invoke()
-                    },
-                    enabled = clickable,
-                    modifier = Modifier.size(width = 48.dp, height = 32.dp),
-                )
+                key(switchAnimationKey) {
+                    Switch(
+                        checked = checked,
+                        onCheckedChange = { checkedValue ->
+                            if (enabled) onChange(checkedValue) else disabledClick?.invoke()
+                        },
+                        enabled = clickable,
+                        modifier = Modifier.size(width = 48.dp, height = 32.dp),
+                    )
+                }
             }
         },
     )

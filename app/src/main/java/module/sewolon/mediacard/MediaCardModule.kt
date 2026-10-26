@@ -32,9 +32,17 @@ class MediaCardModule : XposedModule() {
         if (packageName != null && classLoader != null) {
             // Preserve the target app loader, which belongs to the host process, not this module generation.
             val target = Pair.create(packageName, classLoader)
-            param.setSavedInstanceState(Pair.create(target, pluginClassLoader))
+            val targetAndPlugin = Pair.create(target, pluginClassLoader)
+            val reloadTargets = Pair.create(
+                MusicPluginHooks.prepareForHotReload(),
+                MediaCoverAppearanceHook.snapshotBackgroundClickTargetsForHotReload(),
+            )
+            val managerAndTargets = Pair.create(NativeMusicPanelHook.managerForHotReload(), reloadTargets)
+            param.setSavedInstanceState(
+                Pair.create(targetAndPlugin, managerAndTargets),
+            )
         }
-        HookRuntime.installInfo("Approving API 102 hot reload")
+        HookRuntime.hotReloadInfo("Approving API 102 hot reload")
         return true
     }
 
@@ -42,25 +50,58 @@ class MediaCardModule : XposedModule() {
         HookRuntime.attach(this)
         runCatching { getRemotePreferences(HookFeatureConfig.GROUP) }
             .onSuccess(HookRuntime::attachPreferences)
-            .onFailure { HookRuntime.installWarn("Remote hook settings unavailable after hot reload", it) }
+            .onFailure { HookRuntime.hotReloadWarn("Remote hook settings unavailable after hot reload", it) }
         var unhooked = 0
+        var unhookFailures = 0
         param.oldHookHandles.forEach { handle ->
             runCatching { handle.unhook() }
                 .onSuccess {
                     unhooked++
                     handle.id?.let(HookRuntime::forgetInstalledHook)
                 }
-                .onFailure { HookRuntime.installWarn("Cannot unhook old hook ${handle.id}", it) }
+                .onFailure {
+                    unhookFailures++
+                    HookRuntime.hotReloadWarn("Cannot unhook old hook ${handle.id}", it)
+                }
         }
+        // Preserve IDs for handles that failed to unhook so hook installation cannot stack a
+        // second callback on top of an old one. Successful handles already forget their IDs.
+        if (unhookFailures == 0) HookRuntime.clearInstalledHooks()
         dispatched.clear()
-        HookRuntime.installInfo("Hot reload received ${param.oldHookHandles.size} old hooks; removed=$unhooked")
+        HookRuntime.hotReloadInfo(
+            "Hot reload received ${param.oldHookHandles.size} old hooks; " +
+                "removed=$unhooked, unhookFailed=$unhookFailures",
+        )
         val saved = param.savedInstanceState as? Pair<*, *> ?: return
-        val target = saved.first as? Pair<*, *> ?: return
+        val first = saved.first as? Pair<*, *>
+        // New state wraps target/plugin loaders and the existing OEM manager; accept the
+        // previous target/plugin pair too so cross-version reloads remain compatible.
+        val targetAndPlugin = if (first?.first is Pair<*, *>) first else null
+        val target = (targetAndPlugin?.first ?: saved.first) as? Pair<*, *> ?: return
         val packageName = target.first as? String ?: return
         val classLoader = target.second as? ClassLoader ?: return
-        pluginClassLoader = saved.second as? ClassLoader
+        val managerAndTargets = saved.second as? Pair<*, *>
+        val reloadTargets = managerAndTargets?.second as? Pair<*, *>
+        val savedManager = if (reloadTargets != null) managerAndTargets?.first else saved.second
+        pluginClassLoader = (targetAndPlugin?.second ?: saved.second) as? ClassLoader
+        if (targetAndPlugin != null) NativeMusicPanelHook.restoreManager(savedManager)
         installForTarget(packageName, classLoader)
-        if (packageName == SYSTEM_UI) pluginClassLoader?.let(MusicPluginHooks::install)
+        if (packageName == SYSTEM_UI) {
+            pluginClassLoader?.let(MusicPluginHooks::install)
+            val albumArtViews = (reloadTargets?.first as? List<*>)
+                ?.mapNotNull { it as? android.view.View }
+                .orEmpty()
+            MusicPluginHooks.restoreAlbumArtClickRoutingAfterHotReload(albumArtViews)
+            val backgroundTargets = (reloadTargets?.second as? List<*>)
+                ?.mapNotNull { item ->
+                    val pair = item as? Pair<*, *> ?: return@mapNotNull null
+                    val background = pair.first as? android.view.View ?: return@mapNotNull null
+                    val cover = pair.second as? android.view.View ?: return@mapNotNull null
+                    background to cover
+                }
+                .orEmpty()
+            MediaCoverAppearanceHook.restoreBackgroundClickTargetsAfterHotReload(backgroundTargets)
+        }
     }
 
     private fun installForTarget(packageName: String, loader: ClassLoader) {
@@ -112,7 +153,10 @@ internal object SystemUiMediaHooks {
                     io.github.libxposed.api.XposedInterface.Hooker { chain ->
                         val result = chain.proceed()
                         runCatching {
-                            val info = Reflect.field(requireNotNull(chain.thisObject), "pluginAppInfo") as? ApplicationInfo
+                            val info = Reflect.field(
+                                requireNotNull(chain.thisObject),
+                                "pluginAppInfo",
+                            ) as? ApplicationInfo
                             if (info?.packageName != PLUGIN_PACKAGE) return@runCatching
                             val pluginLoader = when (result) {
                                 is ClassLoader -> result

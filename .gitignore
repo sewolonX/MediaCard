@@ -17,4 +17,5 @@ local.properties
 !.env.example
 /模块与酷安参考对比.md
 /原生锁屏媒体点击修复.md
+/CHANGELOG.md
 /AGENTS.md

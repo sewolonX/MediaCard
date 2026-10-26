@@ -4,6 +4,8 @@
     <string name="settings_title">Settings</string>
     <string name="settings_master">Enable media card</string>
     <string name="settings_master_summary">Turn media card features on or off</string>
+    <string name="settings_scope_incomplete">LSPosed scope incomplete</string>
+    <string name="settings_scope_incomplete_summary">Enable both com.android.systemui and com.oplus.notificationmanager in the module scope</string>
     <string name="settings_swipe">Protect against swipe dismissal</string>
     <string name="settings_swipe_summary">Prevent horizontal swipes from dismissing the media card</string>
     <string name="settings_native_media_controls">Native media notifications</string>
@@ -14,6 +16,17 @@
     <string name="settings_native_media_controls_applied">settings put global qs_media_controls %1$d  Restart System UI</string>
     <string name="settings_logs">Logs</string>
     <string name="settings_logs_summary">Enable or disable module runtime logs</string>
+    <string name="settings_media_cover_size">Media cover size</string>
+    <string name="settings_media_cover_small">Small cover</string>
+    <string name="settings_media_cover_large">Large cover</string>
+    <string name="settings_media_cover_fill_background">Fill background</string>
+    <string name="settings_media_cover_blurred_background">Blurred background</string>
+    <string name="settings_media_cover_small_summary">Keep the OEM default size and behavior</string>
+    <string name="settings_media_cover_large_summary">Use a larger cover in the media card</string>
+    <string name="settings_media_cover_fill_background_summary">Use the cover as a clear card background and hide the separate upper-left cover</string>
+    <string name="settings_media_cover_blurred_background_summary">Use a blurred cover as the card background and hide the separate upper-left cover</string>
+    <string name="settings_media_cover_adaptive_width">Adaptive width</string>
+    <string name="settings_media_cover_adaptive_width_summary">Keep the cover height fixed and adjust its width to the artwork ratio</string>
     <string name="logs_performance_warning">⚠ May affect performance ⚠</string>
     <string name="settings_hide_launcher">Hide desktop icon</string>
     <string name="settings_hide_launcher_summary">Turn off \"Force show desktop icon\" in LSPosed first</string>

@@ -4,26 +4,43 @@ import android.app.KeyguardManager
 import android.content.Context
 import android.os.Bundle
 import android.os.Handler
+import android.os.Looper
 import android.service.notification.StatusBarNotification
 import android.view.View
 import io.github.libxposed.api.XposedInterface
 import java.lang.ref.ReferenceQueue
 import java.lang.ref.WeakReference
-import java.util.HashMap
 import java.util.Collections
+import java.util.HashMap
+import java.util.IdentityHashMap
 import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicReference
 
 /** Keeps the existing expanded music card in the notification center on the plugin's card page. */
+private class AlbumArtClickListener(
+    @Volatile var nativeListener: View.OnClickListener?,
+) : View.OnClickListener {
+    override fun onClick(view: View) {
+        if (!HookRuntime.settingsSnapshot().master || !MusicPluginHooks.routeAlbumArtClick(view)) {
+            nativeListener?.onClick(view)
+        }
+    }
+}
+
 internal object MusicPluginHooks {
     private const val PARSER = "com.oplus.systemui.plugins.shared.data.parse.r"
     private const val MODEL = "com.oplus.systemui.plugins.shared.data.model.f"
     private const val WRAPPER = "com.oplus.systemui.plugins.shared.template.wrapper.impl.h"
     private const val ALBUM_ART_RESOURCE_NAME = "com.oplus.systemui.plugins:id/img_album_art"
+    private const val ALBUM_ART_CLICK_LISTENER_CLASS = "module.sewolon.mediacard.AlbumArtClickListener"
+    private class AlbumArtClickState {
+        @Volatile var nativeListener: View.OnClickListener? = null
+        @Volatile var wrapper: AlbumArtClickListener? = null
+    }
+
     private val parsedMusicModels = WeakIdentitySet()
-    private val albumArtViews = Collections.synchronizedMap(WeakHashMap<View, Boolean>())
-    private val albumArtResourceMatches = Collections.synchronizedMap(WeakHashMap<android.content.res.Resources, HashMap<Int, Boolean>>())
+    private val albumArtClickStates = Collections.synchronizedMap(WeakHashMap<View, AlbumArtClickState>())
     private val lastParserDiagnostic = AtomicReference<String>()
     private val lastConsumerDiagnostics = ConcurrentHashMap<String, String>()
 
@@ -81,8 +98,7 @@ internal object MusicPluginHooks {
 
         installConsumerDiagnostics(loader)
         installAlbumArtViewTracking(loader)
-        installAlbumArtAttachTarget(loader)
-        installAlbumArtPerformClickRouting(loader)
+        MediaCoverAppearanceHook.install(loader)
         MusicCarouselStabilityHook.install(loader)
     }
 
@@ -100,10 +116,9 @@ internal object MusicPluginHooks {
                         val section = chain.thisObject ?: return@Hooker result
                         val view = runCatching { Reflect.field(section, "e") as? View }.getOrNull()
                             ?: return@Hooker result
-                        albumArtViews[view] = true
                         // In both supplied lock-screen hierarchies this ImageView is not clickable.
-                        // Make the exact art view the touch target so its click cannot fall through
-                        // to the outer card's app-launch listener.
+                        // The binder hook installs the click wrapper after the OEM has bound its
+                        // listener, keeping click routing scoped to this exact media-card view.
                         view.isClickable = true
                         if (HookRuntime.isLogsEnabled()) {
                             HookRuntime.info(
@@ -118,65 +133,76 @@ internal object MusicPluginHooks {
         }.onFailure { HookRuntime.installWarn("Media cover View tracking hook unavailable", it) }
     }
 
-    /** Intercept the click on that exact image View, rather than inferring it from a lambda index. */
-    private fun installAlbumArtPerformClickRouting(loader: ClassLoader) {
-        runCatching {
-            val performClick = View::class.java.getDeclaredMethod("performClick")
-            HookRuntime.deoptimize(performClick)
-            HookRuntime.hook("plugin:route-notification-music-cover-click:${System.identityHashCode(loader)}", performClick,
-                XposedInterface.Hooker { chain ->
-                    val view = chain.thisObject as? View ?: return@Hooker chain.proceed()
-                    // The plugin can create T0 before our constructor hook is installed (or reuse
-                    // an existing section), so identity registration alone misses the real cover.
-                    // Match the exact album-art ImageView as well; do not intercept the card body.
-                    if (!isAlbumArtView(view) && albumArtViews[view] != true) {
-                        return@Hooker chain.proceed()
-                    }
-                    if (routeAlbumArtClick(view)) true else chain.proceed()
-                })
-            HookRuntime.installInfo("Notification Center media cover click hook installed")
-        }.onFailure { HookRuntime.installWarn("Media cover click hook unavailable", it) }
+    /** Wrap only the bound media-card image's click listener, preserving the OEM callback. */
+    internal fun installAlbumArtClickRouting(view: View) {
+        if (!isAlbumArtView(view)) return
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            view.post { installAlbumArtClickRouting(view) }
+            return
+        }
+        val nativeListener = runCatching { readOnClickListener(view) }.getOrElse {
+            HookRuntime.runtimeWarn(it) { "Cannot inspect OEM media cover click listener" }
+            return
+        }
+        val unwrappedListener = unwrapPreviousClickListener(nativeListener)
+        val state = synchronized(albumArtClickStates) {
+            albumArtClickStates.getOrPut(view) { AlbumArtClickState() }
+        }
+        val wrapper = state.wrapper ?: synchronized(state) {
+            state.wrapper ?: AlbumArtClickListener(unwrappedListener).also { state.wrapper = it }
+        }
+        if (nativeListener !== wrapper) {
+            state.nativeListener = unwrappedListener
+            wrapper.nativeListener = unwrappedListener
+            view.setOnClickListener(wrapper)
+        }
     }
 
-    /** Catch an already-created or reused plugin image when it joins the view tree. */
-    private fun installAlbumArtAttachTarget(loader: ClassLoader) {
-        runCatching {
-            val attached = View::class.java.getDeclaredMethod("onAttachedToWindow")
-            HookRuntime.hook(
-                "plugin:track-album-art-attach:${System.identityHashCode(loader)}",
-                attached,
-                XposedInterface.Hooker { chain ->
-                    val result = chain.proceed()
-                    val view = chain.thisObject as? View ?: return@Hooker result
-                    if (isAlbumArtView(view)) {
-                        albumArtViews[view] = true
-                        if (!view.isClickable) view.isClickable = true
-                        if (HookRuntime.isLogsEnabled()) {
-                            HookRuntime.info(
-                                "Attached OEM img_album_art made clickable: class=${view.javaClass.name}, " +
-                                    "viewId=0x${view.id.toString(16)}"
-                            )
-                        }
-                    }
-                    result
-                },
-            )
-            HookRuntime.installInfo("OEM img_album_art attach hook installed")
-        }.onFailure { HookRuntime.installWarn("OEM img_album_art attach hook unavailable", it) }
+    internal fun trackedAlbumArtViewsForHotReload(): List<View> =
+        synchronized(albumArtClickStates) { albumArtClickStates.keys.toList() }
+
+    internal fun prepareForHotReload(): List<View> {
+        MusicCarouselStabilityHook.clearPendingRestoresForHotReload()
+        return trackedAlbumArtViewsForHotReload()
+    }
+
+    internal fun restoreAlbumArtClickRoutingAfterHotReload(views: List<View>) {
+        views.forEach(::installAlbumArtClickRouting)
+    }
+
+    private fun unwrapPreviousClickListener(listener: View.OnClickListener?): View.OnClickListener? {
+        if (listener?.javaClass?.name != ALBUM_ART_CLICK_LISTENER_CLASS) return listener
+        return runCatching { Reflect.field(listener, "nativeListener") as? View.OnClickListener }
+            .getOrElse { listener }
+    }
+
+    /** Route a blank background tap through the exact album-art view's normal click path. */
+    internal fun routeBlankBackgroundClick(background: View): Boolean {
+        val cover = MediaCoverAppearanceHook.takeBlankBackgroundClickTarget(background) ?: return false
+        return cover.performClick()
+    }
+
+    private fun readOnClickListener(view: View): View.OnClickListener? {
+        val listenerInfo = Reflect.field(view, "mListenerInfo") ?: return null
+        return Reflect.field(listenerInfo, "mOnClickListener") as? View.OnClickListener
     }
 
     /** Route clicks from the exact album-art image according to the active SystemUI surface. */
-    private fun routeAlbumArtClick(view: View): Boolean {
+    internal fun routeAlbumArtClick(view: View): Boolean {
         val keyguardLocked = runCatching {
             view.context.getSystemService(KeyguardManager::class.java)?.isKeyguardLocked == true
         }.getOrDefault(true)
+        MediaCoverAppearanceHook.repairBackgroundMarginForCard(
+            view,
+            if (keyguardLocked) "lock-screen-cover-click" else "album-art-click",
+        )
         val notificationPanelExpanded = MusicMediaRowHook.isNotificationCenterForeground()
         val notificationCenterSurface = notificationPanelExpanded && !keyguardLocked
         // This cache tracks OPlus Seedling/Live Alert sources only. Standard Android media
         // sessions from other apps are owned by MediaPlayerData and must still reach the
         // native Control Center panel route.
-        val seedlingMedia = MusicSeedlingPlayback.hasEligibleMediaSession()
         if (HookRuntime.isLogsEnabled()) {
+            val seedlingMedia = MusicSeedlingPlayback.hasEligibleMediaSession()
             HookRuntime.info(
                 "OEM media cover tapped: viewId=0x${view.id.toString(16)}, keyguard=$keyguardLocked, " +
                     "notificationPanel=$notificationPanelExpanded, " +
@@ -188,8 +214,11 @@ internal object MusicPluginHooks {
         if (notificationCenterSurface) {
             val opened = NativeMusicPanelHook.open(view)
             if (HookRuntime.isLogsEnabled()) {
-                if (opened) HookRuntime.info("SystemUI album-art click routed directly to native PhoneStyle media dialog")
-                else HookRuntime.warn("SystemUI album-art click matched; native PhoneStyle media dialog was unavailable")
+                if (opened) {
+                    HookRuntime.info("SystemUI album-art click routed directly to native PhoneStyle media dialog")
+                } else {
+                    HookRuntime.warn("SystemUI album-art click matched; native PhoneStyle media dialog was unavailable")
+                }
             }
             // Keep the cover tap from falling through to the card's app-launch listener if
             // the native panel controller is temporarily unavailable.
@@ -212,13 +241,8 @@ internal object MusicPluginHooks {
     private fun isAlbumArtView(view: View): Boolean {
         val id = view.id
         if (id == View.NO_ID) return false
-        val resources = view.resources
-        return synchronized(albumArtResourceMatches) {
-            val matches = albumArtResourceMatches.getOrPut(resources) { HashMap() }
-            matches[id] ?: runCatching {
-                resources.getResourceName(id) == ALBUM_ART_RESOURCE_NAME
-            }.getOrDefault(false).also { matches[id] = it }
-        }
+        return runCatching { view.resources.getResourceName(id) == ALBUM_ART_RESOURCE_NAME }
+            .getOrDefault(false)
     }
 
     private fun installConsumerDiagnostics(loader: ClassLoader) {
@@ -275,11 +299,29 @@ internal object MusicPluginHooks {
 /** Preserve the selected media item when the OEM multi-player list inserts a newly active player. */
 private object MusicCarouselStabilityHook {
     private const val PACKAGE = "com.oplus.systemui.plugins.shared.template.section.media."
+    private class PagerTouchState(val view: WeakReference<View>) {
+        @Volatile var nativeListener: View.OnTouchListener? = null
+        @Volatile var wrapper: View.OnTouchListener? = null
+    }
+    private data class PendingRestore(val view: WeakReference<View>, val callback: Runnable)
+
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val pendingSelection = Collections.synchronizedMap(WeakHashMap<Any, String>())
+    private val pendingRestoreCallbacks =
+        Collections.synchronizedMap(IdentityHashMap<Any, PendingRestore>())
     private val programmaticPageChange = Collections.synchronizedMap(WeakHashMap<Any, Boolean>())
     private val lastPagerTouch = Collections.synchronizedMap(WeakHashMap<Any, Long>())
+    private val pagerTouchStates = Collections.synchronizedMap(WeakHashMap<View, WeakReference<PagerTouchState>>())
+    private val settingsListener: (HookFeatureConfig.Settings) -> Unit = { settings ->
+        if (!settings.master) {
+            mainHandler.post {
+                if (!HookRuntime.settingsSnapshot().master) clearPendingRestores()
+            }
+        }
+    }
 
     fun install(loader: ClassLoader) {
+        HookRuntime.addSettingsListener(settingsListener)
         runCatching {
             val section = Reflect.findClass("${PACKAGE}e1", loader)
             val adapter = Reflect.findClass("${PACKAGE}b1", loader)
@@ -303,6 +345,7 @@ private object MusicCarouselStabilityHook {
                 val newItems = chain.args.getOrNull(0) as? List<*> ?: return@Hooker chain.proceed()
                 val pager = runCatching { Reflect.field(sectionInstance, "s") }.getOrNull()
                     ?: return@Hooker chain.proceed()
+                ensurePagerTouchTracking(pager)
                 val selectedIndex = runCatching { Reflect.call(pager, "getCurrentItem") as? Int }
                     .getOrNull() ?: return@Hooker chain.proceed()
                 val pendingKey = pendingSelection[sectionInstance]
@@ -317,9 +360,9 @@ private object MusicCarouselStabilityHook {
                     if (HookRuntime.isLogsEnabled()) {
                         HookRuntime.info(
                             "Media carousel list changed: current=$selectedIndex/${oldItems.size}, " +
-                                "selected=${diagnosticKey(selectedKey)}, " +
-                                "old=[${oldKeys.joinToString(",") { diagnosticKey(it) }}], " +
-                                "new=[${newKeys.joinToString(",") { diagnosticKey(it) }}]"
+                                "selected=${mediaKeyForLog(selectedKey)}, " +
+                                "old=[${oldKeys.joinToString(",") { mediaKeyForLog(it) }}], " +
+                                "new=[${newKeys.joinToString(",") { mediaKeyForLog(it) }}]"
                         )
                     }
                 } else if (pendingKey != null && !selectionRetained) {
@@ -330,7 +373,8 @@ private object MusicCarouselStabilityHook {
                 } else if (HookRuntime.isLogsEnabled() && oldItems.size > 1) {
                     HookRuntime.info(
                         "Media carousel list updated without insertion: current=$selectedIndex, " +
-                            "oldCount=${oldItems.size}, newCount=${newItems.size}, selectedRetained=${selectedKey in newKeys}"
+                            "oldCount=${oldItems.size}, newCount=${newItems.size}, " +
+                                "selectedRetained=${selectedKey in newKeys}"
                     )
                 }
                 val result = chain.proceed()
@@ -351,6 +395,7 @@ private object MusicCarouselStabilityHook {
                 if (requested != 0) return@Hooker chain.proceed()
                 val pager = runCatching { Reflect.field(instance, "s") }.getOrNull()
                     ?: return@Hooker chain.proceed()
+                ensurePagerTouchTracking(pager)
                 val adapter = runCatching { Reflect.field(instance, "t") }.getOrNull()
                     ?: return@Hooker chain.proceed()
                 val currentIndex = runCatching { Reflect.call(pager, "getCurrentItem") as? Int }
@@ -372,7 +417,7 @@ private object MusicCarouselStabilityHook {
                 if (HookRuntime.isLogsEnabled()) {
                     HookRuntime.info(
                         "Media carousel reset intercepted: requested=$requested, effective=$effectiveIndex, " +
-                            "current=$currentIndex, target=$targetIndex, selected=${diagnosticKey(selectedKey)}"
+                            "current=$currentIndex, target=$targetIndex, selected=${mediaKeyForLog(selectedKey)}"
                     )
                 }
                 // The ListAdapter diff and OEM active-player sorting can take longer than one
@@ -384,16 +429,6 @@ private object MusicCarouselStabilityHook {
             val pageCallback = Reflect.findClass("com.oplus.systemui.plugins.r8.Y6", loader)
             val pageSelected = pageCallback.getDeclaredMethod("a", Int::class.javaPrimitiveType!!)
             HookRuntime.deoptimize(pageSelected)
-            val pagerType = Reflect.findClass("androidx.viewpager2.widget.ViewPager2", loader)
-            val dispatchTouch = pagerType.getDeclaredMethod("dispatchTouchEvent", android.view.MotionEvent::class.java)
-            HookRuntime.hook("plugin:track-media-carousel-touch", dispatchTouch, XposedInterface.Hooker { chain ->
-                val pager = chain.thisObject
-                val event = chain.args.getOrNull(0) as? android.view.MotionEvent
-                if (pager != null && event != null && event.actionMasked != android.view.MotionEvent.ACTION_CANCEL) {
-                    lastPagerTouch[pager] = android.os.SystemClock.uptimeMillis()
-                }
-                chain.proceed()
-            })
             HookRuntime.hook("plugin:clear-pending-selection-on-user-swipe", pageSelected,
                 XposedInterface.Hooker { chain ->
                     val callbackObject = chain.thisObject ?: return@Hooker chain.proceed()
@@ -411,7 +446,7 @@ private object MusicCarouselStabilityHook {
                                 val selectedPage = chain.args.getOrNull(0) as? Int
                                 HookRuntime.info(
                                     "Media carousel selection changed before restore: page=$selectedPage, " +
-                                        "pending=${diagnosticKey(abandoned)}; keeping user choice"
+                                        "pending=${mediaKeyForLog(abandoned)}; keeping user choice"
                                 )
                             }
                         }
@@ -422,6 +457,35 @@ private object MusicCarouselStabilityHook {
         }.onFailure { HookRuntime.installWarn("Multi-player selection preservation unavailable", it) }
     }
 
+    /** Track touches only on the OEM media section's pager, preserving its current listener. */
+    private fun ensurePagerTouchTracking(pager: Any) {
+        val view = pager as? View ?: return
+        val state = synchronized(pagerTouchStates) {
+            pagerTouchStates[view]?.get() ?: PagerTouchState(WeakReference(view)).also {
+                pagerTouchStates[view] = WeakReference(it)
+            }
+        }
+        val current = runCatching {
+            val listenerInfo = Reflect.field(view, "mListenerInfo") ?: return
+            Reflect.field(listenerInfo, "mOnTouchListener") as? View.OnTouchListener
+        }.getOrElse {
+            HookRuntime.runtimeWarn(it) { "Cannot inspect media carousel touch listener" }
+            return
+        }
+        val wrapper = state.wrapper ?: synchronized(state) {
+            state.wrapper ?: View.OnTouchListener { touchedView, event ->
+                if (event.actionMasked != android.view.MotionEvent.ACTION_CANCEL) {
+                    state.view.get()?.let { lastPagerTouch[it] = android.os.SystemClock.uptimeMillis() }
+                }
+                state.nativeListener?.onTouch(touchedView, event) ?: false
+            }.also { state.wrapper = it }
+        }
+        if (current !== wrapper) {
+            state.nativeListener = current
+            view.setOnTouchListener(wrapper)
+        }
+    }
+
     private fun postSelectionRestore(
         section: Any,
         pager: Any,
@@ -430,9 +494,23 @@ private object MusicCarouselStabilityHook {
         stableKey: java.lang.reflect.Method,
         attempt: Int,
     ) {
+        if (!HookRuntime.settingsSnapshot().master) return
         val view = pager as? View ?: return
-        view.postDelayed({
-            if (pendingSelection[section] != selectedKey) return@postDelayed
+        lateinit var callback: Runnable
+        callback = Runnable {
+            val isCurrent = synchronized(pendingRestoreCallbacks) {
+                if (pendingRestoreCallbacks[section]?.callback === callback) {
+                    pendingRestoreCallbacks.remove(section)
+                    true
+                } else {
+                    false
+                }
+            }
+            if (!isCurrent || pendingSelection[section] != selectedKey) return@Runnable
+            if (!HookRuntime.settingsSnapshot().master) {
+                pendingSelection.remove(section)
+                return@Runnable
+            }
             val items = runCatching { Reflect.call(adapter, "getCurrentList") as? List<*> }
                 .getOrNull().orEmpty()
             val index = items.indexOfFirst { item ->
@@ -446,7 +524,7 @@ private object MusicCarouselStabilityHook {
                     if (HookRuntime.isLogsEnabled()) {
                         HookRuntime.info(
                             "Media carousel selection restored after list diff: from=$current, to=$index, " +
-                                "selected=${diagnosticKey(selectedKey)}"
+                                "selected=${mediaKeyForLog(selectedKey)}"
                         )
                     }
                 }
@@ -463,7 +541,48 @@ private object MusicCarouselStabilityHook {
                     HookRuntime.info("Media carousel selection not restored: selected item was removed from list")
                 }
             }
-        }, 16L)
+        }
+        synchronized(pendingRestoreCallbacks) {
+            pendingRestoreCallbacks.remove(section)?.let { pending ->
+                pending.view.get()?.removeCallbacks(pending.callback)
+            }
+            pendingRestoreCallbacks[section] = PendingRestore(WeakReference(view), callback)
+        }
+        view.postDelayed(callback, 16L)
+    }
+
+    fun clearPendingRestoresForHotReload() {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            clearPendingRestores()
+        } else {
+            mainHandler.post(::clearPendingRestores)
+        }
+    }
+
+    private fun clearPendingRestores() {
+        synchronized(pendingRestoreCallbacks) {
+            pendingRestoreCallbacks.values.forEach { pending ->
+                pending.view.get()?.removeCallbacks(pending.callback)
+            }
+            pendingRestoreCallbacks.clear()
+        }
+        pendingSelection.clear()
+        programmaticPageChange.clear()
+        lastPagerTouch.clear()
+
+        val trackedPagers = synchronized(pagerTouchStates) {
+            pagerTouchStates.entries.mapNotNull { (view, reference) ->
+                reference.get()?.let { state -> view to state }
+            }
+        }
+        trackedPagers.forEach { (view, state) ->
+            val wrapper = state.wrapper ?: return@forEach
+            val current = runCatching {
+                val listenerInfo = Reflect.field(view, "mListenerInfo") ?: return@runCatching null
+                Reflect.field(listenerInfo, "mOnTouchListener") as? View.OnTouchListener
+            }.getOrNull()
+            if (current === wrapper) view.setOnTouchListener(state.nativeListener)
+        }
     }
 
     private fun markProgrammaticPageChange(section: Any, pager: Any) {

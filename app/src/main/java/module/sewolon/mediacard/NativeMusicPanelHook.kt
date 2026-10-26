@@ -3,6 +3,7 @@ package module.sewolon.mediacard
 import android.content.Context
 import android.view.View
 import io.github.libxposed.api.XposedInterface
+import java.lang.reflect.Modifier
 
 /** Opens the OEM PhoneStyle media dialog directly from a SystemUI media-card cover. */
 internal object NativeMusicPanelHook {
@@ -10,10 +11,19 @@ internal object NativeMusicPanelHook {
     private const val SEPARATE_QS_PLUGIN = "com.android.systemui.plugins.qs.OplusSeparateQSPlugin"
 
     @Volatile private var separateQsManager: Any? = null
+    @Volatile private var managerType: Class<*>? = null
+
+    fun managerForHotReload(): Any? = separateQsManager
+
+    fun restoreManager(manager: Any?) {
+        if (manager?.javaClass?.name == SEPARATE_QS_MANAGER) separateQsManager = manager
+    }
 
     fun install(loader: ClassLoader) {
         runCatching {
             val managerType = Reflect.findClass(SEPARATE_QS_MANAGER, loader)
+            this.managerType = managerType
+            findExistingManager(managerType)?.let(::captureManager)
             managerType.declaredConstructors.forEachIndexed { index, constructor ->
                 HookRuntime.hook("systemui:phone-style-manager:$index", constructor,
                     XposedInterface.Hooker { chain ->
@@ -41,7 +51,7 @@ internal object NativeMusicPanelHook {
 
     /** Resolves the OEM dialog controller from its Dagger Lazy factory without opening Quick Settings. */
     fun open(albumArtView: View): Boolean {
-        val manager = separateQsManager
+        val manager = separateQsManager ?: managerType?.let(::findExistingManager)?.also(::captureManager)
             ?: return unavailable("OplusSeparateQSManager was not captured")
         return runCatching {
             val factoryLazy = Reflect.field(manager, "qsMediaFactory")
@@ -55,10 +65,10 @@ internal object NativeMusicPanelHook {
             // dialog interactor to show the full PhoneStyle media player. It does not require a
             // media tile or an attached Quick Settings media panel view.
             Reflect.call(dialogController, "showPrompt", albumArtView)
-            HookRuntime.info("Requested native PhoneStyle media dialog directly from album art")
+            HookRuntime.runtimeInfo { "Requested native PhoneStyle media dialog directly from album art" }
             true
         }.onFailure {
-            HookRuntime.warn("Cannot open native PhoneStyle media dialog directly", it)
+            HookRuntime.runtimeWarn(it) { "Cannot open native PhoneStyle media dialog directly" }
         }.getOrDefault(false)
     }
 
@@ -69,8 +79,21 @@ internal object NativeMusicPanelHook {
         }
     }
 
+    /** Recover an instance constructed before this hook generation was installed. */
+    private fun findExistingManager(type: Class<*>): Any? = runCatching {
+        type.declaredFields.firstNotNullOfOrNull { field ->
+            if (!Modifier.isStatic(field.modifiers) || !type.isAssignableFrom(field.type)) {
+                return@firstNotNullOfOrNull null
+            }
+            runCatching {
+                if (!field.isAccessible) field.isAccessible = true
+                field.get(null)
+            }.getOrNull()?.takeIf(type::isInstance)
+        }
+    }.getOrNull()
+
     private fun unavailable(reason: String): Boolean {
-        HookRuntime.warn("Native PhoneStyle media dialog unavailable: $reason")
+        HookRuntime.runtimeWarn { "Native PhoneStyle media dialog unavailable: $reason" }
         return false
     }
 }
